@@ -1,10 +1,11 @@
 import * as THREE from "three";
 import type { SplatMesh } from "@sparkjsdev/spark";
-import { processCommand } from "./agent";
+import { processCommand, processRefinement } from "./agent";
 import {
   executeOperations,
   setAssetExtractionHandler,
   undoLastEdit,
+  undoN,
 } from "./executor";
 import {
   addAsset,
@@ -121,6 +122,8 @@ async function bootstrap() {
     processCommand,
     executeOperations,
     undoLastEdit,
+    undoN,
+    processRefinement,
     getSplatMesh: () => viewer.splatMesh,
     getScreenshot,
     getScreenshotCropAroundPoint,

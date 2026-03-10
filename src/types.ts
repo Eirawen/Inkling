@@ -64,6 +64,13 @@ export interface SDFShapeConfig {
   displace?: [number, number, number];
 }
 
+export interface RefinementResponse {
+  accept: boolean;
+  confidence: number;
+  reason: string;
+  corrections: EditOperation[];
+}
+
 export interface AssetEntry {
   id: string;
   label: string;

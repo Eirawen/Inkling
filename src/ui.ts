@@ -7,7 +7,9 @@ import {
   type processCommand as processCommandFn,
 } from "./agent";
 import { buildLocalSelection, formatSelectionHint } from "./click-selection";
-import type { executeOperations as executeOperationsFn, undoLastEdit as undoLastEditFn } from "./executor";
+import type { executeOperations as executeOperationsFn, undoLastEdit as undoLastEditFn, undoN as undoNFn } from "./executor";
+import type { processRefinement as processRefinementFn } from "./agent";
+import { refineEdit } from "./refine";
 import { getManifestJSON } from "./scene-manifest";
 import { getCellAtWorldPos, getNeighborCells } from "./spatial-index";
 import type { AssetEntry, SceneManifest, SpatialGrid } from "./types";
@@ -15,11 +17,15 @@ import type { AssetEntry, SceneManifest, SpatialGrid } from "./types";
 type ProcessCommand = typeof processCommandFn;
 type ExecuteOperations = typeof executeOperationsFn;
 type UndoLastEdit = typeof undoLastEditFn;
+type UndoN = typeof undoNFn;
+type ProcessRefinement = typeof processRefinementFn;
 
 export interface UIDependencies {
   processCommand: ProcessCommand;
   executeOperations: ExecuteOperations;
   undoLastEdit: UndoLastEdit;
+  undoN: UndoN;
+  processRefinement: ProcessRefinement;
   getSplatMesh: () => SplatMesh;
   getScreenshot: () => string;
   getScreenshotCropAroundPoint?: (point: THREE.Vector3, sizePx?: number) => string | null;
@@ -114,6 +120,7 @@ export function initUI(deps: UIDependencies): void {
   document.body.append(toastContainer);
 
   let selectedAssetId: string | null = null;
+  let lastEditGroupSize = 0;
   let provider: "gemini" | "openai" = DEFAULT_PROVIDER;
   setProviderPreference(provider);
   providerButton.textContent = provider === "gemini" ? "Gemini" : "OpenAI";
@@ -281,12 +288,53 @@ export function initUI(deps: UIDependencies): void {
       console.log(`[ui] Agent returned ${operations.length} operation(s)`);
       console.log(`[ui] Operation summary: ${summarizeOperations(operations)}`);
 
-      deps.executeOperations(operations, splatMesh);
+      const appliedEdits = deps.executeOperations(operations, splatMesh);
       console.log("[ui] Executor applied operations");
+
+      // Refine targeted edits (delete, recolor) but not atmosphere/light
+      const isTargetedEdit = operations.some(
+        (op) => op.action === "delete" || op.action === "recolor"
+      );
+      let refinementNote = "";
+      let totalEditsForUndo = appliedEdits.length;
+
+      if (isTargetedEdit) {
+        setStatus(status, "Refining...");
+        try {
+          const result = await refineEdit(
+            operations,
+            appliedEdits,
+            command,
+            clickPoint,
+            splatMesh,
+            {
+              processRefinement: deps.processRefinement,
+              executeOperations: (ops, parent) => deps.executeOperations(ops, parent),
+              undoN: deps.undoN,
+              getScreenshot: deps.getScreenshot,
+              getScreenshotCropAroundPoint: deps.getScreenshotCropAroundPoint,
+              getApiKey: readGeminiApiKey,
+            }
+          );
+          totalEditsForUndo = result.totalEditsApplied;
+          if (result.iterations > 0) {
+            refinementNote = result.accepted
+              ? ` (refined in ${result.iterations} iteration${result.iterations === 1 ? "" : "s"})`
+              : ` (refinement: ${result.reason})`;
+          }
+          console.log(
+            `[ui] Refinement complete: iterations=${result.iterations} accepted=${result.accepted} totalEdits=${result.totalEditsApplied}`
+          );
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          console.warn(`[ui] Refinement failed: ${msg}`);
+        }
+      }
+
       appendMessage(
         messages,
         "assistant",
-        `Applied ${operations.length} operation${operations.length === 1 ? "" : "s"}.`
+        `Applied ${operations.length} operation${operations.length === 1 ? "" : "s"}.${refinementNote}`
       );
 
       for (const op of operations) {
@@ -294,6 +342,8 @@ export function initUI(deps: UIDependencies): void {
         showToast(`✓ ${op.action}: ${summary}`);
       }
 
+      // Store undo count for grouped undo
+      lastEditGroupSize = totalEditsForUndo;
       renderLibrary();
       const assetsAfter = deps.listAssets?.().length ?? assetsBefore;
       const createdCount = Math.max(0, assetsAfter - assetsBefore);
@@ -334,12 +384,24 @@ export function initUI(deps: UIDependencies): void {
 
   undoButton.addEventListener("click", () => {
     console.log("[ui] Undo button clicked");
-    const undone = deps.undoLastEdit();
-    if (undone) {
-      appendMessage(messages, "system", "Undid last edit.");
-      showToast("↩ Undid last edit");
+    if (lastEditGroupSize > 1) {
+      const undone = deps.undoN(lastEditGroupSize);
+      lastEditGroupSize = 0;
+      if (undone > 0) {
+        appendMessage(messages, "system", `Undid ${undone} edit${undone === 1 ? "" : "s"}.`);
+        showToast(`↩ Undid ${undone} edits`);
+      } else {
+        showToast("No edits to undo", 1800);
+      }
     } else {
-      showToast("No edits to undo", 1800);
+      const undone = deps.undoLastEdit();
+      lastEditGroupSize = 0;
+      if (undone) {
+        appendMessage(messages, "system", "Undid last edit.");
+        showToast("↩ Undid last edit");
+      } else {
+        showToast("No edits to undo", 1800);
+      }
     }
   });
 
@@ -365,12 +427,24 @@ export function initUI(deps: UIDependencies): void {
     }
     console.log("[ui] Undo shortcut triggered");
     event.preventDefault();
-    const undone = deps.undoLastEdit();
-    if (undone) {
-      appendMessage(messages, "system", "Undid last edit.");
-      showToast("↩ Undid last edit");
+    if (lastEditGroupSize > 1) {
+      const count = deps.undoN(lastEditGroupSize);
+      lastEditGroupSize = 0;
+      if (count > 0) {
+        appendMessage(messages, "system", `Undid ${count} edit${count === 1 ? "" : "s"}.`);
+        showToast(`↩ Undid ${count} edits`);
+      } else {
+        showToast("No edits to undo", 1800);
+      }
     } else {
-      showToast("No edits to undo", 1800);
+      const undone = deps.undoLastEdit();
+      lastEditGroupSize = 0;
+      if (undone) {
+        appendMessage(messages, "system", "Undid last edit.");
+        showToast("↩ Undid last edit");
+      } else {
+        showToast("No edits to undo", 1800);
+      }
     }
   });
 

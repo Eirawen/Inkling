@@ -150,6 +150,25 @@ export function undoLastEdit(): boolean {
   return true;
 }
 
+export function undoN(count: number): number {
+  const toUndo = Math.min(count, history.length);
+  console.log(`[executor] undoN requested=${count} actual=${toUndo} historyBefore=${history.length}`);
+  let undone = 0;
+  for (let i = 0; i < toUndo; i++) {
+    const entry = history.pop();
+    if (!entry) break;
+    const removalParent = entry.edit.parent ?? entry.addedParent;
+    removalParent.remove(entry.edit);
+    const maybeDisposable = entry.edit as unknown as { dispose?: () => void };
+    if (typeof maybeDisposable.dispose === "function") {
+      maybeDisposable.dispose();
+    }
+    undone++;
+  }
+  console.log(`[executor] undoN undone=${undone} historyAfter=${history.length}`);
+  return undone;
+}
+
 export function undoAllEdits(): void {
   console.log(`[executor] undoAllEdits called for ${history.length} edit(s)`);
   while (history.length > 0) {

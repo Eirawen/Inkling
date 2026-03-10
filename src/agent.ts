@@ -1,6 +1,6 @@
 import { GoogleGenAI, type GenerateContentResponse } from "@google/genai";
 import * as THREE from "three";
-import type { EditOperation, SDFShapeConfig, VoxelCell } from "./types";
+import type { EditOperation, RefinementResponse, SDFShapeConfig, VoxelCell } from "./types";
 
 const GEMINI_MODEL = "gemini-3-flash-preview";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
@@ -1033,6 +1033,117 @@ function formatVec3(vec: THREE.Vector3): string {
 
 function formatColor(color: THREE.Color): string {
   return `[${color.r.toFixed(3)}, ${color.g.toFixed(3)}, ${color.b.toFixed(3)}]`;
+}
+
+const REFINEMENT_SYSTEM_PROMPT = `You are a visual QA assistant for 3D gaussian splat edits.
+
+You receive:
+1. The original user command
+2. A summary of the edit operations that were applied
+3. A post-edit screenshot (full scene) and optionally a crop around the edit region
+
+Your job: evaluate whether the edit achieved the user's intent.
+
+Respond with a JSON object (no markdown, no prose):
+{
+  "accept": true/false,
+  "confidence": 0.0-1.0,
+  "reason": "brief explanation",
+  "corrections": []
+}
+
+If accept is false, provide corrections as an array of EditOperation objects (same format as the original system).
+Corrections should adjust position, scale, or radius — not start from scratch.
+Common fixes: enlarge radius/scale if remnants visible, shift position if off-center.
+Keep corrections minimal — one shape adjustment is better than a full rewrite.`;
+
+export async function processRefinement(
+  command: string,
+  opsSummary: string,
+  screenshotBase64: string | null,
+  cropBase64: string | null,
+  apiKey: string
+): Promise<RefinementResponse> {
+  const geminiApiKey = apiKey.trim();
+  const openAIApiKey = readOpenAIApiKey();
+  if (!geminiApiKey && !openAIApiKey) {
+    throw new Error("[agent] ERROR: missing API key for refinement");
+  }
+
+  const userText = [
+    `Original command: ${command}`,
+    "",
+    "Applied operations:",
+    opsSummary,
+    "",
+    "Evaluate the result. Return only a JSON object with accept, confidence, reason, and corrections.",
+  ].join("\n");
+
+  console.log(`[agent] processRefinement start command="${command}" opsChars=${opsSummary.length}`);
+
+  const preferOpenAI = providerPreference === "openai";
+
+  if (geminiApiKey && !preferOpenAI) {
+    try {
+      const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+      const contents = buildContents(userText, screenshotBase64, cropBase64);
+      const response = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents,
+        config: {
+          temperature: 0,
+          maxOutputTokens: 2048,
+          systemInstruction: REFINEMENT_SYSTEM_PROMPT,
+        },
+      });
+      const text = extractTextFromGeminiResponse(response);
+      return parseRefinementResponse(text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[agent] Gemini refinement failed: ${message}`);
+      if (!openAIApiKey) throw error;
+    }
+  }
+
+  if (openAIApiKey) {
+    const text = await requestOpenAIText(openAIApiKey, userText, screenshotBase64, cropBase64);
+    return parseRefinementResponse(text);
+  }
+
+  throw new Error("[agent] No provider available for refinement");
+}
+
+function parseRefinementResponse(responseText: string): RefinementResponse {
+  const trimmed = responseText.trim();
+  const candidates: string[] = [trimmed];
+  const markdownMatch = trimmed.match(MARKDOWN_JSON_REGEX);
+  if (markdownMatch?.[1]) {
+    candidates.push(markdownMatch[1].trim());
+  }
+
+  for (const candidate of dedupeStrings(candidates)) {
+    try {
+      const parsed = JSON.parse(candidate) as Record<string, unknown>;
+      const accept = typeof parsed.accept === "boolean" ? parsed.accept : true;
+      const confidence = typeof parsed.confidence === "number" ? clamp(parsed.confidence, 0, 1) : 0.5;
+      const reason = typeof parsed.reason === "string" ? parsed.reason : "";
+      let corrections: EditOperation[] = [];
+      if (Array.isArray(parsed.corrections) && parsed.corrections.length > 0) {
+        try {
+          corrections = validateOperations(parsed.corrections, "refinement");
+        } catch {
+          console.warn("[agent] Refinement corrections failed validation; ignoring corrections");
+          corrections = [];
+        }
+      }
+      return { accept, confidence, reason, corrections };
+    } catch {
+      continue;
+    }
+  }
+
+  console.warn("[agent] Could not parse refinement response; defaulting to accept");
+  return { accept: true, confidence: 0.5, reason: "parse failure", corrections: [] };
 }
 
 export { SYSTEM_PROMPT };

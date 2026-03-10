@@ -28,8 +28,7 @@ let defaultAssetSeeded = false;
 
 const MIN_ASSET_SPLATS = 1;
 const MAX_EXTRACTED_SPLATS = 120_000;
-const MIN_OPACITY = 0.1;
-const MAX_COLOR_DISTANCE = 0.52;
+const MIN_OPACITY = 0.02;
 const EPSILON = 1e-6;
 
 const tmpLocal = new THREE.Vector3();
@@ -44,7 +43,7 @@ export function extractAssetFromDeleteOperation(
   }
 
   const startMs = nowMs();
-  const compiledShapes = compileSupportedShapes(op.shapes);
+  const compiledShapes = compileSupportedShapes(op.shapes, op.softEdge ?? 0.1);
   if (compiledShapes.length === 0) {
     console.warn(
       `[asset-library] No supported delete shapes found for extraction. opShapes=${op.shapes
@@ -104,19 +103,10 @@ export function extractAssetFromDeleteOperation(
     return null;
   }
 
-  const avgColor = averageColor(working);
-  const colorFiltered = working.filter(
-    (splat) => colorDistance(splat.color, avgColor) <= MAX_COLOR_DISTANCE
-  );
+  const kept = working;
 
-  const kept = colorFiltered.length >= MIN_ASSET_SPLATS ? colorFiltered : working;
-
-  if (colorFiltered.length < MIN_ASSET_SPLATS) {
-    console.log(
-      `[asset-library] Color filter fallback: before=${working.length} after=${colorFiltered.length}`
-    );
-  }
-
+  // Sort by opacity descending so truncation keeps most visually important splats
+  kept.sort((a, b) => b.opacity - a.opacity);
   const truncated = kept.slice(0, MAX_EXTRACTED_SPLATS);
   const centroid = computeCentroid(truncated);
   const bounds = computeBounds(truncated);
@@ -148,7 +138,7 @@ export function extractAssetFromDeleteOperation(
 
   const elapsedMs = nowMs() - startMs;
   console.log(
-    `[asset-library] Extracted asset "${entry.label}" splats=${entry.splatCount} inside=${insideRegionCount} filteredOpacity=${filteredLowOpacity} keptAfterColor=${kept.length} ms=${elapsedMs.toFixed(1)}`
+    `[asset-library] Extracted asset "${entry.label}" splats=${entry.splatCount} inside=${insideRegionCount} filteredOpacity=${filteredLowOpacity} kept=${kept.length} ms=${elapsedMs.toFixed(1)}`
   );
 
   return entry;
@@ -348,7 +338,7 @@ function slugifyLabel(label: string): string {
   return base || "asset";
 }
 
-function compileSupportedShapes(shapes: SDFShapeConfig[]): CompiledShape[] {
+function compileSupportedShapes(shapes: SDFShapeConfig[], softEdge: number = 0): CompiledShape[] {
   const compiled: CompiledShape[] = [];
 
   for (const shape of shapes) {
@@ -381,11 +371,33 @@ function compileSupportedShapes(shapes: SDFShapeConfig[]): CompiledShape[] {
       ? new THREE.Vector3(shape.scale[0], shape.scale[1], shape.scale[2])
       : new THREE.Vector3(shape.radius ?? 0.5, shape.radius ?? 0.5, shape.radius ?? 0.5);
 
+    let radius = shape.radius ?? Math.max(scale.x, scale.y, scale.z);
+
+    // Expand shapes by softEdge to match GPU SplatEdit fade zone
+    if (softEdge > 0) {
+      switch (shape.type) {
+        case "SPHERE":
+          radius += softEdge;
+          break;
+        case "BOX":
+        case "ELLIPSOID":
+          scale.addScalar(softEdge);
+          break;
+        case "CYLINDER":
+          radius += softEdge;
+          scale.y += softEdge;
+          break;
+        case "CAPSULE":
+          radius += softEdge;
+          break;
+      }
+    }
+
     compiled.push({
       type: shape.type,
       position,
       inverseRotation: rotation.clone().invert(),
-      radius: shape.radius ?? Math.max(scale.x, scale.y, scale.z),
+      radius,
       scale,
     });
   }
@@ -449,28 +461,6 @@ function pointInsideCompiledShape(point: THREE.Vector3, shape: CompiledShape): b
     default:
       return false;
   }
-}
-
-function averageColor(splats: CapturedSplat[]): THREE.Color {
-  let r = 0;
-  let g = 0;
-  let b = 0;
-
-  for (const splat of splats) {
-    r += splat.color.r;
-    g += splat.color.g;
-    b += splat.color.b;
-  }
-
-  const inv = 1 / Math.max(1, splats.length);
-  return new THREE.Color(r * inv, g * inv, b * inv);
-}
-
-function colorDistance(a: THREE.Color, b: THREE.Color): number {
-  const dr = a.r - b.r;
-  const dg = a.g - b.g;
-  const db = a.b - b.b;
-  return Math.sqrt(dr * dr + dg * dg + db * db);
 }
 
 function computeCentroid(splats: CapturedSplat[]): THREE.Vector3 {
