@@ -54,4 +54,16 @@
 
 23. **Asset extraction can silently return empty if selection is too small or shape type is unsupported.** If a delete op produces no library item, check extraction logs (`[asset-library]`) for: unsupported shape types, low kept splat count, or aggressive thresholds. Current implementation supports `SPHERE`, `ELLIPSOID`, `BOX`, `CYLINDER`, and `CAPSULE`, with `MIN_ASSET_SPLATS=8`.
 
-24. **Spatial grid and click points must be in the same frame.** `forEachSplat()` and `getBoundingBox()` are in `SplatMesh` local space, while raycast `hit.point` is world space. If the mesh has a non-identity transform (for example `quaternion.set(1,0,0,0)`), local-grid lookup with world click points will target mirrored/wrong cells. Build the grid in world space (transform bounds + centers with `matrixWorld`) or explicitly convert clicks to local before lookup.
+24. **softEdge on delete operations creates blurry semi-transparent residue.** When SplatEdit uses `MULTIPLY` with `opacity=0` and `softEdge > 0`, splats at the boundary transition gradually from visible to invisible. This produces a ghostly/blurry halo around the deletion. For clean deletions, force `softEdge=0` (hard cutoff). Executor now does this automatically for `action === "delete"`.
+
+25. **Boundary splats near a deleted object are contaminated by the object's color.** When identifying "background" splats around a deletion SDF, splats just outside the surface (small SDF distance) are often still part of the deleted object (the SDF doesn't perfectly match the object boundary). Splats further from the surface are more likely actual background. Weight by SDF distance when sampling color for infill.
+
+26. **Cached splat positions are already world-space — don't apply OpenCV quaternion fix to meshes built from them.** `buildSpatialGrid` transforms positions via `matrixWorld` into world space. If you create a new `SplatMesh` from `PackedSplats` using those positions, do NOT set `mesh.quaternion.set(1,0,0,0)` — that would double-transform them. Only the original scene `.spz` mesh needs the OpenCV fix.
+
+27. **Splats captured at grazing angles around occluded objects look blurry when exposed.** When an object is deleted, surrounding splats that were captured at oblique angles (partially occluded by the deleted object during scanning) become visible and look smudged/distorted. Mitigate by oversizing the deletion SDF by ~12% to eat these degraded boundary splats, then let infill cover the larger hole.
+
+28. **K-means normal clustering can produce spurious tilted surfaces from mixed normals.** When boundary splats include normals from both the floor and the sides of a deleted object, averaging produces a ~45-degree normal that generates a tilted fill disk. Filter by: (a) skip clusters with <15% of the largest cluster's splat count, (b) skip planes with inlier ratio <0.5.
+
+29. **Regular grid sampling for fill splats produces visible dot patterns.** Even with jitter, a structured grid is perceptible. Use ≥60% jitter (relative to spacing) plus slight off-plane displacement (15% of spacing) to break the pattern.
+
+30. **Spatial grid and click points must be in the same frame.** `forEachSplat()` and `getBoundingBox()` are in `SplatMesh` local space, while raycast `hit.point` is world space. If the mesh has a non-identity transform (for example `quaternion.set(1,0,0,0)`), local-grid lookup with world click points will target mirrored/wrong cells. Build the grid in world space (transform bounds + centers with `matrixWorld`) or explicitly convert clicks to local before lookup.

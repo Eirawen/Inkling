@@ -6,8 +6,11 @@ export interface RefinementDependencies {
   processRefinement: (
     command: string,
     opsSummary: string,
-    screenshotBase64: string | null,
-    cropBase64: string | null,
+    preEditScreenshotBase64: string | null,
+    preEditCropBase64: string | null,
+    postEditScreenshotBase64: string | null,
+    postEditCropBase64: string | null,
+    selectionHint: string | null,
     apiKey: string
   ) => Promise<RefinementResponse>;
   executeOperations: (ops: EditOperation[], parent: THREE.Object3D) => SplatEdit[];
@@ -45,6 +48,9 @@ export async function refineEdit(
   command: string,
   clickPosition: THREE.Vector3 | null,
   editParent: THREE.Object3D,
+  preEditScreenshotBase64: string | null,
+  preEditCropBase64: string | null,
+  selectionHint: string | null,
   deps: RefinementDependencies,
   config?: Partial<RefinementConfig>
 ): Promise<RefinementResult> {
@@ -78,8 +84,11 @@ export async function refineEdit(
       refinement = await deps.processRefinement(
         command,
         opsSummary,
+        preEditScreenshotBase64,
+        preEditCropBase64,
         screenshot,
         crop,
+        selectionHint,
         apiKey
       );
     } catch (error) {

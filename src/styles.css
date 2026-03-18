@@ -227,6 +227,37 @@ html, body {
   color: rgba(255, 255, 255, 0.68);
 }
 
+.muse-correction-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0;
+}
+
+.muse-correction-btn {
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  padding: 4px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.muse-correction-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.muse-correction-btn.accept {
+  border-color: rgba(96, 212, 255, 0.6);
+  color: rgb(96, 212, 255);
+}
+
+.muse-correction-btn.accept:hover {
+  background: rgba(96, 212, 255, 0.15);
+}
+
 @media (max-width: 768px) {
   #muse-chat-container {
     right: 0;

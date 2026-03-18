@@ -28,6 +28,7 @@ main.ts
   ├── scene-manifest.ts  # Scene understanding; wraps voxel grid (+ optional Claude Vision)
   ├── agent.ts           # Claude API call: user command + context → EditOperation[]
   ├── executor.ts        # EditOperation[] → Spark SplatEdit/SplatEditSdf objects
+  ├── infill.ts          # Hole-filling after delete: boundary detection → normal clustering → RANSAC plane fit → fill splat generation
   ├── asset-library.ts   # Extract splats on delete, store as PackedSplats, click-to-place
   ├── ui.ts              # Chat panel, asset library sidebar, selection highlight, toasts
   └── types.ts           # Shared interfaces (VoxelCell, EditOperation, AssetEntry, etc.)

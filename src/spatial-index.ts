@@ -30,8 +30,40 @@ const DEFAULT_OPTIONS: SpatialIndexOptions = {
   logPrefix: "[spatial]",
 };
 
+// Cached world-space positions and colors from the last buildSpatialGrid call.
+// Populated once at startup, used by buildLocalGrid for fine-grained re-binning.
+let cachedWorldPositions: Float32Array | null = null;
+let cachedWorldColors: Float32Array | null = null;
+let cachedQuaternions: Float32Array | null = null;   // x,y,z,w per splat (4 floats)
+let cachedScales: Float32Array | null = null;         // x,y,z per splat (3 floats)
+let cachedOpacities: Float32Array | null = null;      // 1 float per splat
+let cachedSplatCount = 0;
+
 export function gridKey(x: number, y: number, z: number): string {
   return `${x},${y},${z}`;
+}
+
+export interface CachedSplatData {
+  positions: Float32Array;
+  colors: Float32Array;
+  quaternions: Float32Array;
+  scales: Float32Array;
+  opacities: Float32Array;
+  count: number;
+}
+
+export function getCachedSplatData(): CachedSplatData | null {
+  if (!cachedWorldPositions || !cachedWorldColors || !cachedQuaternions || !cachedScales || !cachedOpacities || cachedSplatCount === 0) {
+    return null;
+  }
+  return {
+    positions: cachedWorldPositions,
+    colors: cachedWorldColors,
+    quaternions: cachedQuaternions,
+    scales: cachedScales,
+    opacities: cachedOpacities,
+    count: cachedSplatCount,
+  };
 }
 
 export function computeNominalCellSize(
@@ -171,9 +203,40 @@ export function buildSpatialGrid(
   const start = nowMs();
   const worldCenter = new THREE.Vector3();
 
-  splatMesh.forEachSplat((index, center, _scales, _quat, _opacity, color) => {
+  // First pass: count splats to allocate cache arrays
+  let splatCountEstimate = 0;
+  splatMesh.forEachSplat(() => { splatCountEstimate += 1; });
+
+  // Allocate cache arrays for local grid re-binning and infill
+  const positions = new Float32Array(splatCountEstimate * 3);
+  const colors = new Float32Array(splatCountEstimate * 3);
+  const quaternions = new Float32Array(splatCountEstimate * 4);
+  const scales = new Float32Array(splatCountEstimate * 3);
+  const opacities = new Float32Array(splatCountEstimate);
+
+  splatMesh.forEachSplat((index, center, splatScales, quat, opacity, color) => {
     totalSplats += 1;
     worldCenter.copy(center).applyMatrix4(matrixWorld);
+
+    // Cache world position and color for later local grid building
+    const i3 = index * 3;
+    positions[i3] = worldCenter.x;
+    positions[i3 + 1] = worldCenter.y;
+    positions[i3 + 2] = worldCenter.z;
+    colors[i3] = color.r;
+    colors[i3 + 1] = color.g;
+    colors[i3 + 2] = color.b;
+
+    // Cache quaternion, scale, opacity for infill
+    const i4 = index * 4;
+    quaternions[i4] = quat.x;
+    quaternions[i4 + 1] = quat.y;
+    quaternions[i4 + 2] = quat.z;
+    quaternions[i4 + 3] = quat.w;
+    scales[i3] = splatScales.x;
+    scales[i3 + 1] = splatScales.y;
+    scales[i3 + 2] = splatScales.z;
+    opacities[index] = opacity;
 
     const coord = worldPosToGridCoord(worldCenter, croppedBounds, config.resolution);
     if (!coord) {
@@ -210,6 +273,16 @@ export function buildSpatialGrid(
     acc.max.max(worldCenter);
     acc.splatIndices.push(index);
   });
+
+  // Store cached data for buildLocalGrid and infill
+  cachedWorldPositions = positions;
+  cachedWorldColors = colors;
+  cachedQuaternions = quaternions;
+  cachedScales = scales;
+  cachedOpacities = opacities;
+  cachedSplatCount = totalSplats;
+  const totalBytes = positions.byteLength + colors.byteLength + quaternions.byteLength + scales.byteLength + opacities.byteLength;
+  console.log(`${logPrefix} Cached ${totalSplats} splat data (${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
 
   const cells = new Map<string, VoxelCell>();
   for (const [key, acc] of accumulators) {
@@ -350,6 +423,115 @@ export function serializeSpatialGridForLLM(
   };
 
   return JSON.stringify(payload);
+}
+
+export function buildLocalGrid(
+  globalGrid: SpatialGrid,
+  center: THREE.Vector3,
+  extent: THREE.Vector3,
+  resolution: [number, number, number] = [10, 10, 10]
+): SpatialGrid | null {
+  if (!cachedWorldPositions || !cachedWorldColors || cachedSplatCount === 0) {
+    console.warn("[spatial] buildLocalGrid: no cached splat data available");
+    return null;
+  }
+
+  const localBounds = new THREE.Box3(
+    new THREE.Vector3(center.x - extent.x, center.y - extent.y, center.z - extent.z),
+    new THREE.Vector3(center.x + extent.x, center.y + extent.y, center.z + extent.z)
+  );
+
+  // Collect splat indices from coarse cells that overlap the local bounds
+  const candidateIndices: number[] = [];
+  for (const cell of globalGrid.cells.values()) {
+    if (localBounds.intersectsBox(cell.worldBounds)) {
+      for (const idx of cell.splatIndices) {
+        candidateIndices.push(idx);
+      }
+    }
+  }
+
+  if (candidateIndices.length === 0) {
+    console.log("[spatial] buildLocalGrid: no splats in local region");
+    return null;
+  }
+
+  const [rx, ry, rz] = resolution;
+  const cellSize = computeNominalCellSize(localBounds, resolution);
+  const nominalCellVolume = Math.max(cellSize.x * cellSize.y * cellSize.z, 1e-9);
+  const accumulators = new Map<string, VoxelAccumulator>();
+  const pos = cachedWorldPositions;
+  const col = cachedWorldColors;
+  const worldPos = new THREE.Vector3();
+  let binned = 0;
+
+  for (const idx of candidateIndices) {
+    const i3 = idx * 3;
+    if (i3 + 2 >= pos.length) continue;
+
+    worldPos.set(pos[i3], pos[i3 + 1], pos[i3 + 2]);
+    if (!localBounds.containsPoint(worldPos)) continue;
+
+    const coord = worldPosToGridCoord(worldPos, localBounds, resolution);
+    if (!coord) continue;
+
+    const [gx, gy, gz] = coord;
+    const key = gridKey(gx, gy, gz);
+    let acc = accumulators.get(key);
+    if (!acc) {
+      acc = {
+        gridPos: [gx, gy, gz],
+        count: 0,
+        sumPos: new THREE.Vector3(),
+        sumColor: new THREE.Vector3(),
+        sumColorSq: new THREE.Vector3(),
+        min: new THREE.Vector3(worldPos.x, worldPos.y, worldPos.z),
+        max: new THREE.Vector3(worldPos.x, worldPos.y, worldPos.z),
+        splatIndices: [],
+      };
+      accumulators.set(key, acc);
+    }
+
+    const r = col[i3], g = col[i3 + 1], b = col[i3 + 2];
+    acc.count += 1;
+    acc.sumPos.add(worldPos);
+    acc.sumColor.x += r;
+    acc.sumColor.y += g;
+    acc.sumColor.z += b;
+    acc.sumColorSq.x += r * r;
+    acc.sumColorSq.y += g * g;
+    acc.sumColorSq.z += b * b;
+    acc.min.min(worldPos);
+    acc.max.max(worldPos);
+    acc.splatIndices.push(idx);
+    binned += 1;
+  }
+
+  const cells = new Map<string, VoxelCell>();
+  for (const [key, acc] of accumulators) {
+    cells.set(key, finalizeVoxelCell(acc, nominalCellVolume));
+  }
+
+  console.log(
+    `[spatial] Built local grid ${rx}x${ry}x${rz}: occupied=${cells.size} binnedSplats=${binned} candidates=${candidateIndices.length}`
+  );
+
+  return {
+    resolution,
+    worldBounds: localBounds,
+    cellSize,
+    cells,
+  };
+}
+
+export function serializeLocalGridForLLM(
+  grid: SpatialGrid,
+  options: { maxCells?: number; minSplats?: number } = {}
+): string {
+  return serializeSpatialGridForLLM(grid, {
+    maxCells: options.maxCells ?? 200,
+    minSplats: options.minSplats ?? 3,
+  });
 }
 
 function finalizeVoxelCell(acc: VoxelAccumulator, nominalCellVolume: number): VoxelCell {

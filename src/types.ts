@@ -35,7 +35,7 @@ export interface SemanticRegion {
 }
 
 export interface EditOperation {
-  action: "delete" | "recolor" | "light" | "darken" | "atmosphere";
+  action: "delete" | "recolor" | "tint" | "light" | "darken" | "atmosphere";
   shapes: SDFShapeConfig[];
   blendMode: "MULTIPLY" | "SET_RGB" | "ADD_RGBA";
   softEdge?: number;
@@ -69,6 +69,14 @@ export interface RefinementResponse {
   confidence: number;
   reason: string;
   corrections: EditOperation[];
+}
+
+export interface InfillConfig {
+  softEdge?: number;
+  sdfSmooth?: number;
+  boundaryWidth?: number;
+  maxFillSplats?: number;
+  maxClusters?: number;
 }
 
 export interface AssetEntry {

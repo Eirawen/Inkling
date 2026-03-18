@@ -1,5 +1,5 @@
 import type { SplatMesh } from "@sparkjsdev/spark";
-import type * as THREE from "three";
+import * as THREE from "three";
 import {
   buildClickContext,
   setProviderPreference,
@@ -7,12 +7,13 @@ import {
   type processCommand as processCommandFn,
 } from "./agent";
 import { buildLocalSelection, formatSelectionHint } from "./click-selection";
-import type { executeOperations as executeOperationsFn, undoLastEdit as undoLastEditFn, undoN as undoNFn } from "./executor";
+import { transformOperations, setInfillHandler, type executeOperations as executeOperationsFn, type undoLastEdit as undoLastEditFn, type undoN as undoNFn } from "./executor";
+import { generateInfill } from "./infill";
 import type { processRefinement as processRefinementFn } from "./agent";
 import { refineEdit } from "./refine";
 import { getManifestJSON } from "./scene-manifest";
-import { getCellAtWorldPos, getNeighborCells } from "./spatial-index";
-import type { AssetEntry, SceneManifest, SpatialGrid } from "./types";
+import { buildLocalGrid, getCellAtWorldPos, getNeighborCells, serializeLocalGridForLLM } from "./spatial-index";
+import type { AssetEntry, EditOperation, SceneManifest, SpatialGrid } from "./types";
 
 type ProcessCommand = typeof processCommandFn;
 type ExecuteOperations = typeof executeOperationsFn;
@@ -61,6 +62,13 @@ export function initUI(deps: UIDependencies): void {
   console.log(
     `[ui] Selection config: hintsEnabled=${ENABLE_CLICK_SELECTION_HINTS} minConfidence=${MIN_SELECTION_CONFIDENCE.toFixed(2)} cropPx=${CROP_SIZE_PX}`
   );
+
+  // Register infill handler for hole-filling after delete operations
+  setInfillHandler((shapes, opts) => {
+    const grid = deps.getGrid();
+    if (!grid) return null;
+    return generateInfill(shapes, grid, opts);
+  });
 
   const container = document.createElement("div");
   container.id = "muse-chat-container";
@@ -121,6 +129,9 @@ export function initUI(deps: UIDependencies): void {
 
   let selectedAssetId: string | null = null;
   let lastEditGroupSize = 0;
+  let lastAppliedOps: EditOperation[] | null = null;
+  let lastAppliedParent: THREE.Object3D | null = null;
+  let correctionRow: HTMLDivElement | null = null;
   let provider: "gemini" | "openai" = DEFAULT_PROVIDER;
   setProviderPreference(provider);
   providerButton.textContent = provider === "gemini" ? "Gemini" : "OpenAI";
@@ -187,6 +198,65 @@ export function initUI(deps: UIDependencies): void {
     }
   };
 
+  const dismissCorrectionButtons = () => {
+    if (correctionRow) {
+      correctionRow.remove();
+      correctionRow = null;
+    }
+    lastAppliedOps = null;
+    lastAppliedParent = null;
+  };
+
+  const showCorrectionButtons = () => {
+    dismissCorrectionButtons();
+    if (!lastAppliedOps || !lastAppliedParent) return;
+
+    correctionRow = document.createElement("div");
+    correctionRow.className = "muse-correction-row";
+
+    const grid = deps.getGrid();
+    const step = grid ? Math.max(grid.cellSize.x, grid.cellSize.y, grid.cellSize.z) * 0.5 : 0.2;
+
+    const buttons: Array<{ label: string; transform: Parameters<typeof transformOperations>[1]; className?: string }> = [
+      { label: "Bigger", transform: { scaleMultiplier: 1.25 } },
+      { label: "Smaller", transform: { scaleMultiplier: 0.8 } },
+      { label: "← Left", transform: { positionOffset: [-step, 0, 0] } },
+      { label: "→ Right", transform: { positionOffset: [step, 0, 0] } },
+      { label: "↑ Up", transform: { positionOffset: [0, step, 0] } },
+      { label: "↓ Down", transform: { positionOffset: [0, -step, 0] } },
+    ];
+
+    for (const btn of buttons) {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = `muse-correction-btn${btn.className ? ` ${btn.className}` : ""}`;
+      el.textContent = btn.label;
+      el.addEventListener("click", () => {
+        if (!lastAppliedOps || !lastAppliedParent) return;
+        deps.undoN(lastEditGroupSize);
+        const transformed = transformOperations(lastAppliedOps, btn.transform);
+        const newEdits = deps.executeOperations(transformed, lastAppliedParent);
+        lastAppliedOps = transformed;
+        lastEditGroupSize = newEdits.length;
+        showToast(`Adjusted: ${btn.label}`, 1200);
+      });
+      correctionRow.append(el);
+    }
+
+    const acceptBtn = document.createElement("button");
+    acceptBtn.type = "button";
+    acceptBtn.className = "muse-correction-btn accept";
+    acceptBtn.textContent = "Accept";
+    acceptBtn.addEventListener("click", () => {
+      dismissCorrectionButtons();
+      showToast("Edit accepted", 1200);
+    });
+    correctionRow.append(acceptBtn);
+
+    messages.append(correctionRow);
+    messages.scrollTop = messages.scrollHeight;
+  };
+
   renderLibrary();
 
   if (deps.onSplatClick) {
@@ -245,6 +315,7 @@ export function initUI(deps: UIDependencies): void {
       return;
     }
 
+    dismissCorrectionButtons();
     const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     const assetsBefore = deps.listAssets?.().length ?? 0;
     appendMessage(messages, "user", command);
@@ -273,6 +344,15 @@ export function initUI(deps: UIDependencies): void {
       const voxelContext = buildVoxelContext(grid, clickPoint);
       const manifestSummary = manifest ? getManifestJSON(manifest) : null;
       setSecondaryScreenshotForNextCommand(screenshotCrop || null);
+
+      // Compute selection hint separately for reuse in refinement
+      let selectionHint: string | null = null;
+      if (ENABLE_CLICK_SELECTION_HINTS && grid && clickPoint) {
+        const sel = buildLocalSelection(grid, clickPoint);
+        if (sel && sel.confidence >= MIN_SELECTION_CONFIDENCE) {
+          selectionHint = formatSelectionHint(sel);
+        }
+      }
       console.log(
         `[ui] Prompt payload: voxelContextChars=${voxelContext?.length ?? 0} manifestChars=${manifestSummary?.length ?? 0}`
       );
@@ -293,7 +373,7 @@ export function initUI(deps: UIDependencies): void {
 
       // Refine targeted edits (delete, recolor) but not atmosphere/light
       const isTargetedEdit = operations.some(
-        (op) => op.action === "delete" || op.action === "recolor"
+        (op) => op.action === "delete" || op.action === "recolor" || op.action === "tint"
       );
       let refinementNote = "";
       let totalEditsForUndo = appliedEdits.length;
@@ -307,6 +387,9 @@ export function initUI(deps: UIDependencies): void {
             command,
             clickPoint,
             splatMesh,
+            screenshot || null,
+            screenshotCrop || null,
+            selectionHint,
             {
               processRefinement: deps.processRefinement,
               executeOperations: (ops, parent) => deps.executeOperations(ops, parent),
@@ -344,6 +427,14 @@ export function initUI(deps: UIDependencies): void {
 
       // Store undo count for grouped undo
       lastEditGroupSize = totalEditsForUndo;
+
+      // Show correction buttons for targeted edits
+      if (isTargetedEdit) {
+        lastAppliedOps = operations;
+        lastAppliedParent = splatMesh;
+        showCorrectionButtons();
+      }
+
       renderLibrary();
       const assetsAfter = deps.listAssets?.().length ?? assetsBefore;
       const createdCount = Math.max(0, assetsAfter - assetsBefore);
@@ -384,6 +475,7 @@ export function initUI(deps: UIDependencies): void {
 
   undoButton.addEventListener("click", () => {
     console.log("[ui] Undo button clicked");
+    dismissCorrectionButtons();
     if (lastEditGroupSize > 1) {
       const undone = deps.undoN(lastEditGroupSize);
       lastEditGroupSize = 0;
@@ -427,6 +519,7 @@ export function initUI(deps: UIDependencies): void {
     }
     console.log("[ui] Undo shortcut triggered");
     event.preventDefault();
+    dismissCorrectionButtons();
     if (lastEditGroupSize > 1) {
       const count = deps.undoN(lastEditGroupSize);
       lastEditGroupSize = 0;
@@ -537,7 +630,23 @@ function buildVoxelContext(
   console.log(
     `[ui] Deterministic selection included confidence=${selection.confidence.toFixed(3)} cells=${selection.clusterCellKeys.length}`
   );
-  return `${baseContext}\n\n${hint}`;
+
+  let context = `${baseContext}\n\n${hint}`;
+
+  // Build high-resolution local grid around the selection cluster
+  const clusterSize = new THREE.Vector3();
+  selection.clusterBounds.getSize(clusterSize);
+  const localExtent = clusterSize.clone().multiplyScalar(1.0); // 2x cluster bounds
+  const localGrid = buildLocalGrid(grid, selection.clusterCenter, localExtent);
+  if (localGrid && localGrid.cells.size > 0) {
+    const localGridJSON = serializeLocalGridForLLM(localGrid);
+    context += `\n\nLocal high-resolution grid (10x10x10 around selection):\n${localGridJSON}`;
+    console.log(
+      `[ui] Local grid appended: cells=${localGrid.cells.size} chars=${localGridJSON.length}`
+    );
+  }
+
+  return context;
 }
 
 function normalizeScreenshotDataUrl(dataUrl: string): string {

@@ -15,6 +15,7 @@ let providerPreference: "gemini" | "openai" = "gemini";
 const ACTIONS = new Set<EditOperation["action"]>([
   "delete",
   "recolor",
+  "tint",
   "light",
   "darken",
   "atmosphere",
@@ -82,11 +83,19 @@ Available SDF shape types and usage:
 - Best for global full-scene effects.
 - Params: position (use [0,0,0] unless a specific anchor is provided).
 
-Blend modes and exact behavior:
-- MULTIPLY + opacity: 0 => DELETE (splats become invisible)
-- MULTIPLY + color [0.3, 0.3, 0.3] => DARKEN
-- SET_RGB + color => RECOLOR (override RGB, keep alpha)
-- ADD_RGBA + color => ADD LIGHT / atmospheric additive tint
+Actions and blend modes:
+- action "delete": MULTIPLY + opacity: 0 => splats become invisible
+- action "darken": MULTIPLY + color [0.3, 0.3, 0.3] => darken region
+- action "tint": MULTIPLY + color => COLOR TINT that preserves texture, shadows, and highlights.
+  The color channels act as multipliers: [0.3, 0.3, 1.0] keeps blue, crushes red/green → blue tint.
+  [1.0, 0.8, 0.5] → warm golden tint. [0.4, 1.0, 0.4] → green tint.
+  Always keep the target channel near 1.0 and suppress others. Preserve luminance variation.
+  This is the DEFAULT for color-change commands like "make this blue", "paint it red", "autumn colors".
+- action "recolor": SET_RGB + color => FLAT COLOR OVERRIDE. Replaces all color with a uniform value.
+  Destroys texture and shading. Only use when the user explicitly wants a flat/uniform/solid color
+  (e.g. "make this solid red", "flat white", "uniform black").
+- action "light": ADD_RGBA + color => additive light/glow
+- action "atmosphere": ADD_RGBA on ALL shape => global tint
 
 softEdge:
 - Feathers shape boundaries in world-space units.
@@ -110,6 +119,8 @@ Geometry selection heuristics:
 - For organic shapes (trees/bushes), prefer SPHERE or SPHERE+CYLINDER compound.
 - For flat/wide vehicles, roads, facades, prefer BOX.
 - Size shapes to object dimensions from context. Do not under-size edits.
+- When a "Local high-resolution grid" is provided, prefer it over the global grid for object boundary detection near the click.
+- Local grid cells are finer — use their positions and sizes for precise shape placement and sizing.
 
 Response format requirements:
 - Return ONLY a JSON array of EditOperation objects.
@@ -135,15 +146,15 @@ Example A: "Remove this tree" with click [3.2,1.0,-2.1], bbox approx width 2.2, 
 Example B: "Make this building red" with click [8.0,2.5,4.0], bbox approx 6x5x4
 [
   {
-    "action": "recolor",
-    "blendMode": "SET_RGB",
+    "action": "tint",
+    "blendMode": "MULTIPLY",
     "softEdge": 0.1,
     "shapes": [
       {
         "type": "BOX",
         "position": [8.0, 2.5, 4.0],
         "scale": [3.0, 2.5, 2.0],
-        "color": [0.75, 0.18, 0.14],
+        "color": [1.0, 0.25, 0.2],
         "opacity": 1.0
       }
     ]
@@ -203,12 +214,12 @@ Example E: "Make the shadows deeper"
 Example F: "Autumn foliage"
 [
   {
-    "action": "recolor",
-    "blendMode": "SET_RGB",
+    "action": "tint",
+    "blendMode": "MULTIPLY",
     "softEdge": 0.14,
     "shapes": [
-      { "type": "ELLIPSOID", "position": [4.0, 2.2, -1.5], "scale": [1.8, 1.6, 1.4], "color": [0.78, 0.38, 0.12], "opacity": 1.0 },
-      { "type": "ELLIPSOID", "position": [7.2, 2.6, -3.1], "scale": [2.0, 1.8, 1.6], "color": [0.68, 0.24, 0.10], "opacity": 1.0 }
+      { "type": "ELLIPSOID", "position": [4.0, 2.2, -1.5], "scale": [1.8, 1.6, 1.4], "color": [1.0, 0.5, 0.15], "opacity": 1.0 },
+      { "type": "ELLIPSOID", "position": [7.2, 2.6, -3.1], "scale": [2.0, 1.8, 1.6], "color": [0.9, 0.35, 0.15], "opacity": 1.0 }
     ]
   }
 ]
@@ -632,6 +643,64 @@ async function requestOpenAIText(
   return text;
 }
 
+async function requestOpenAIRefinementText(
+  apiKey: string,
+  userText: string,
+  preEditBase64: string | null,
+  preEditCropBase64: string | null,
+  postEditBase64: string | null,
+  postEditCropBase64: string | null
+): Promise<string> {
+  const content: Array<
+    | { type: "input_text"; text: string }
+    | { type: "input_image"; image_url: string }
+  > = [];
+
+  for (const raw of [preEditBase64, preEditCropBase64, postEditBase64, postEditCropBase64]) {
+    const normalized = normalizeScreenshotBase64(raw);
+    if (normalized) {
+      content.push({
+        type: "input_image",
+        image_url: `data:image/png;base64,${normalized}`,
+      });
+    }
+  }
+
+  content.push({ type: "input_text", text: userText });
+
+  const imageParts = content.filter((item) => item.type === "input_image").length;
+  console.log(
+    `[agent] OpenAI refinement request model=${OPENAI_FALLBACK_MODEL} imageParts=${imageParts} promptChars=${userText.length}`
+  );
+
+  const response = await fetch(OPENAI_RESPONSES_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_FALLBACK_MODEL,
+      instructions: REFINEMENT_SYSTEM_PROMPT,
+      temperature: 0,
+      max_output_tokens: 2048,
+      input: [{ role: "user", content }],
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await extractOpenAIError(response);
+    throw new Error(
+      `OpenAI refinement request failed (${response.status} ${response.statusText}): ${errorText}`
+    );
+  }
+
+  const payload = (await response.json()) as OpenAIResponsePayload;
+  const text = extractTextFromOpenAIResponse(payload);
+  console.log(`[agent] OpenAI refinement response text chars=${text.length}`);
+  return text;
+}
+
 function extractTextFromOpenAIResponse(payload: OpenAIResponsePayload): string {
   if (typeof payload.output_text === "string" && payload.output_text.trim()) {
     return payload.output_text.trim();
@@ -991,6 +1060,9 @@ function canonicalBlendModeForAction(
   if (action === "delete") {
     return "MULTIPLY";
   }
+  if (action === "tint") {
+    return "MULTIPLY";
+  }
   if (action === "recolor") {
     return "SET_RGB";
   }
@@ -1040,9 +1112,21 @@ const REFINEMENT_SYSTEM_PROMPT = `You are a visual QA assistant for 3D gaussian 
 You receive:
 1. The original user command
 2. A summary of the edit operations that were applied
-3. A post-edit screenshot (full scene) and optionally a crop around the edit region
+3. Images in order: pre-edit scene, pre-edit crop (around click), post-edit scene, post-edit crop. Some may be absent.
+4. Optionally, spatial context from a click-selected cluster (bounds, center, dimensions)
 
-Your job: evaluate whether the edit achieved the user's intent.
+Compare the before and after images to evaluate whether the edit achieved the user's intent.
+
+For delete operations:
+- The target region should be fully invisible/removed with no visible remnants within shape bounds.
+- If remnants are visible at edges, suggest enlarging radius/scale by 1.2-1.5x.
+- If the wrong area was deleted, suggest shifting position toward the intended target.
+
+For recolor operations:
+- The target region should uniformly show the new color with no spillover to adjacent objects.
+- If partial coverage, suggest expanding the shape or shifting position.
+
+Use the spatial context (cluster bounds, center, dimensions) when provided to judge whether the shape covers the intended region.
 
 Respond with a JSON object (no markdown, no prose):
 {
@@ -1060,8 +1144,11 @@ Keep corrections minimal — one shape adjustment is better than a full rewrite.
 export async function processRefinement(
   command: string,
   opsSummary: string,
-  screenshotBase64: string | null,
-  cropBase64: string | null,
+  preEditScreenshotBase64: string | null,
+  preEditCropBase64: string | null,
+  postEditScreenshotBase64: string | null,
+  postEditCropBase64: string | null,
+  selectionHint: string | null,
   apiKey: string
 ): Promise<RefinementResponse> {
   const geminiApiKey = apiKey.trim();
@@ -1070,23 +1157,41 @@ export async function processRefinement(
     throw new Error("[agent] ERROR: missing API key for refinement");
   }
 
-  const userText = [
+  const lines: string[] = [
     `Original command: ${command}`,
     "",
     "Applied operations:",
     opsSummary,
     "",
-    "Evaluate the result. Return only a JSON object with accept, confidence, reason, and corrections.",
-  ].join("\n");
+    "Images provided in order: (1) pre-edit scene, (2) pre-edit crop around target, (3) post-edit scene, (4) post-edit crop around target.",
+    "Compare before and after to evaluate whether the edit achieved the user's intent.",
+  ];
 
-  console.log(`[agent] processRefinement start command="${command}" opsChars=${opsSummary.length}`);
+  if (selectionHint) {
+    lines.push("");
+    lines.push("Spatial context from click selection:");
+    lines.push(selectionHint);
+  }
+
+  lines.push("");
+  lines.push("Evaluate the result. Return only a JSON object with accept, confidence, reason, and corrections.");
+
+  const userText = lines.join("\n");
+
+  console.log(`[agent] processRefinement start command="${command}" opsChars=${opsSummary.length} hasPreEdit=${Boolean(preEditScreenshotBase64)} hasSelection=${Boolean(selectionHint)}`);
 
   const preferOpenAI = providerPreference === "openai";
 
   if (geminiApiKey && !preferOpenAI) {
     try {
       const ai = new GoogleGenAI({ apiKey: geminiApiKey });
-      const contents = buildContents(userText, screenshotBase64, cropBase64);
+      const contents = buildRefinementContents(
+        userText,
+        preEditScreenshotBase64,
+        preEditCropBase64,
+        postEditScreenshotBase64,
+        postEditCropBase64
+      );
       const response = await ai.models.generateContent({
         model: GEMINI_MODEL,
         contents,
@@ -1106,11 +1211,51 @@ export async function processRefinement(
   }
 
   if (openAIApiKey) {
-    const text = await requestOpenAIText(openAIApiKey, userText, screenshotBase64, cropBase64);
+    const text = await requestOpenAIRefinementText(
+      openAIApiKey,
+      userText,
+      preEditScreenshotBase64,
+      preEditCropBase64,
+      postEditScreenshotBase64,
+      postEditCropBase64
+    );
     return parseRefinementResponse(text);
   }
 
   throw new Error("[agent] No provider available for refinement");
+}
+
+function buildRefinementContents(
+  userText: string,
+  preEditBase64: string | null,
+  preEditCropBase64: string | null,
+  postEditBase64: string | null,
+  postEditCropBase64: string | null
+): Array<{
+  role: "user";
+  parts: Array<
+    | { text: string }
+    | { inlineData: { mimeType: "image/png"; data: string } }
+  >;
+}> {
+  const parts: Array<
+    | { text: string }
+    | { inlineData: { mimeType: "image/png"; data: string } }
+  > = [];
+
+  // Images in order: pre-edit full, pre-edit crop, post-edit full, post-edit crop
+  for (const raw of [preEditBase64, preEditCropBase64, postEditBase64, postEditCropBase64]) {
+    const normalized = normalizeScreenshotBase64(raw);
+    if (normalized) {
+      parts.push({ inlineData: { mimeType: "image/png", data: normalized } });
+    }
+  }
+
+  const imageParts = parts.length;
+  console.log(`[agent] buildRefinementContents images=${imageParts} textChars=${userText.length}`);
+
+  parts.push({ text: userText });
+  return [{ role: "user", parts }];
 }
 
 function parseRefinementResponse(responseText: string): RefinementResponse {

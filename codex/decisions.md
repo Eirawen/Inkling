@@ -35,7 +35,18 @@
 **Decision:** Use Marble's 500k splat export option for all web demo scenes, not the 2M version.
 **Rationale:** 500k splats render well on laptops, load faster, and raycast faster. The 2M version is more detailed but causes performance issues in browser. For a live demo, smooth 60fps matters more than maximum detail.
 
-## AD-008: Spatial grid canonical frame is world space
+## AD-008: Composite hole-filling algorithm for deletions (infill.ts)
+**Date:** 2026-03-17
+**Decision:** Implement a 4-step deterministic infill pipeline triggered automatically after every delete operation: (1) identify boundary splats near the SDF surface, (2) cluster by surface normal via k-means, (3) RANSAC plane fitting per cluster, (4) sample fill positions on planes inside the deletion SDF and assign properties from outer boundary splats.
+**Rationale:** Gaussian splat captures are 2.5D — behind a deleted object there is zero captured data. The hole needs synthetic fill. We evaluated 7 algorithm categories (see `codex/algorithms.md`): wavefront diffusion (too blurry), Poisson surface reconstruction (too heavy), texture synthesis (too slow), view-dependent projection (breaks on camera movement). The composite approach (algorithm 7C) combines surface segmentation (2B) + RANSAC (6C) + donor cloning (3C) for the best quality-to-complexity tradeoff. Key refinements discovered during implementation:
+- Boundary width must be adaptive to shape dimensions (~20% of smallest axis), not a fixed multiplier of softEdge
+- Boundary splat count must be capped (~2000) with stride subsampling to keep k-means + KNN under 500ms
+- SDF distance weighting is critical for color assignment — inner boundary is contaminated by the deleted object, outer boundary represents actual background
+- Visual SplatEdit deletion should oversize by ~12% to consume degraded grazing-angle splats, while infill uses original shapes for boundary detection
+- Small/weak clusters (< 15% of largest, inlier ratio < 0.5) must be filtered to avoid spurious tilted fill disks
+- Fill splat scale must be computed from grid spacing (1.5x for overlap), not inherited from boundary splat scale which is too small for covering flat surfaces
+
+## AD-009: Spatial grid canonical frame is world space
 **Date:** 2026-02-28
 **Decision:** `SpatialGrid.worldBounds`, `VoxelCell.worldCenter`, and `VoxelCell.worldBounds` are built in world space by transforming local splat centers/bounds with `splatMesh.matrixWorld`.
 **Rationale:** Raycast clicks are world-space coordinates. Building the grid in local mesh space caused wrong-cell lookups when the mesh had non-identity transforms (notably the required `quaternion.set(1,0,0,0)` orientation fix). World-space indexing removes downstream conversion bugs across UI selection hints, voxel context, and SDF placement.
